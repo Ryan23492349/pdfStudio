@@ -55,6 +55,8 @@ type PdfPageItem = {
   sourceId: string;
   sourceIndex: number;
   sourceRotation: number;
+  sourceWidth?: number; // 記錄來源頁面的原始寬度（用於空白頁）
+  sourceHeight?: number; // 記錄來源頁面的原始高度（用於空白頁）
   preview: string;
   rotation: number;
   textAnnotations: PdfTextAnnotation[];
