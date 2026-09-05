@@ -726,12 +726,16 @@ export default function Home() {
   const addBlankPage = (pageIndex: number) => {
     setPages((current) => {
       const nextPages = [...current];
-      // A4 尺寸比例：210 x 297 mm (1:1.414)
-      // 使用較大的尺寸以支援高解析度預覽
-      const a4Width = 595; // A4 在 72 DPI 下的像素寬度
-      const a4Height = 842; // A4 在 72 DPI 下的像素高度
+      // 取得前一頁的尺寸作為空白頁的尺寸
+      const prevPage = current[pageIndex - 1] ?? current[pageIndex] ?? current[0];
+      // 使用預設 A4 尺寸作為後備
+      const defaultWidth = 595;
+      const defaultHeight = 842;
+      const pageWidth = prevPage?.sourceWidth ?? defaultWidth;
+      const pageHeight = prevPage?.sourceHeight ?? defaultHeight;
+      
       const whitePageSvg = `
-        <svg width="${a4Width}" height="${a4Height}" xmlns="http://www.w3.org/2000/svg">
+        <svg width="${pageWidth}" height="${pageHeight}" xmlns="http://www.w3.org/2000/svg">
           <rect width="100%" height="100%" fill="#FFFFFF" stroke="#CCCCCC" stroke-width="1"/>
         </svg>
       `;
@@ -742,6 +746,8 @@ export default function Home() {
         sourceId: "", // 空白頁沒有來源文件
         sourceIndex: -1, // 空白頁沒有來源索引
         sourceRotation: 0,
+        sourceWidth: pageWidth, // 記錄來源頁面寬度
+        sourceHeight: pageHeight, // 記錄來源頁面高度
         preview: svgDataUri,
         rotation: 0,
         textAnnotations: [],
