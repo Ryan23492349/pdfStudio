@@ -726,20 +726,29 @@ export default function Home() {
       const nextPages = [...current];
       // 取得前一頁的資訊來建立空白頁（使用相同的 sourceId 和 rotation）
       const prevPage = pages[pageIndex];
+      // 建立純白色頁面 (RGB 255, 255, 255)
+      const whitePageSvg = `
+        <svg width="200" height="283" xmlns="http://www.w3.org/2000/svg">
+          <rect width="100%" height="100%" fill="#FFFFFF" stroke="#CCCCCC" stroke-width="1"/>
+        </svg>
+      `;
+      const svgDataUri = 'data:image/svg+xml;base64,' + btoa(whitePageSvg);
+      
       const blankPage: PdfPageItem = {
         id: createPageId(),
         sourceId: prevPage?.sourceId ?? "",
         sourceIndex: prevPage?.sourceIndex ?? 0,
         sourceRotation: prevPage?.sourceRotation ?? 0,
-        preview: "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjI4MyIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjZjVmNWY1IiBzdHJva2U9IiNkMWQxZDEiIHN0cm9rZS1kYXNoYXJyYXk9IjQgNCIvPjx0ZXh0IHg9IjUwJSIgeT0iNTAlIiBmb250LWZhbWlseT0ic2Fucy1zZXJpZiIgZm9udC1zaXplPSIxNCIgZmlsbD0iIzlhOWE5YSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZHk9Ii4zZW0iPuW+hee7nC9ibGFuayBwYWdlPC90ZXh0Pjwvc3ZnPg==",
+        preview: svgDataUri,
         rotation: 0,
         textAnnotations: [],
       };
-      nextPages.splice(pageIndex + 1, 0, blankPage);
+      // 插入空白頁到「前一頁」
+      nextPages.splice(pageIndex, 0, blankPage);
       return nextPages;
     });
-    setSplitPoints((current) => current.map((point) => (point >= pageIndex + 1 ? point + 1 : point)));
-    toast.success("已新增空白頁面。", { description: "空白頁已插入於目前頁面的下一頁。" });
+    setSplitPoints((current) => current.map((point) => (point >= pageIndex ? point + 1 : point)));
+    toast.success("已新增空白頁面。", { description: "空白頁已插入於目前頁面的前一頁。" });
   };
 
   const deletePage = (pageIndex: number) => {
