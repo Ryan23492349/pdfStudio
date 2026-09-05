@@ -724,8 +724,6 @@ export default function Home() {
   const addBlankPage = (pageIndex: number) => {
     setPages((current) => {
       const nextPages = [...current];
-      // 取得前一頁的資訊來建立空白頁（使用相同的 sourceId 和 rotation）
-      const prevPage = pages[pageIndex];
       // 建立純白色頁面 (RGB 255, 255, 255)
       const whitePageSvg = `
         <svg width="200" height="283" xmlns="http://www.w3.org/2000/svg">
@@ -736,9 +734,9 @@ export default function Home() {
       
       const blankPage: PdfPageItem = {
         id: createPageId(),
-        sourceId: prevPage?.sourceId ?? "",
-        sourceIndex: prevPage?.sourceIndex ?? 0,
-        sourceRotation: prevPage?.sourceRotation ?? 0,
+        sourceId: "", // 空白頁沒有來源文件
+        sourceIndex: -1, // 空白頁沒有來源索引
+        sourceRotation: 0,
         preview: svgDataUri,
         rotation: 0,
         textAnnotations: [],
@@ -1037,7 +1035,7 @@ export default function Home() {
               )}
             </DialogHeader>
             <div ref={previewViewportRef} className="page-preview-canvas react-pdf-preview" aria-busy={isPreviewLoading} aria-label="可捲動的完整 PDF 頁面預覽" tabIndex={0}>
-              {previewDocumentFile && (
+              {previewDocumentFile ? (
                 <Document
                   file={previewDocumentFile}
                   loading={<div className="preview-render-status"><Loader2 className="animate-spin" size={19} /><span>正在載入原始 PDF 頁面</span></div>}
@@ -1088,6 +1086,12 @@ export default function Home() {
                     </div>
                   </div>
                 </Document>
+              ) : (
+                <div className="page-preview-canvas" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+                  <div style={{ width: '200px', height: '283px' }}>
+                    <img src={previewedPage.preview} alt="空白頁面預覽" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+                  </div>
+                </div>
               )}
               {previewLoadError && <div className="preview-render-status preview-render-status-error">高解析預覽載入失敗，請關閉後再試。</div>}
             </div>
