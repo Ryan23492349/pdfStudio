@@ -724,9 +724,12 @@ export default function Home() {
   const addBlankPage = (pageIndex: number) => {
     setPages((current) => {
       const nextPages = [...current];
-      // 建立純白色頁面 (RGB 255, 255, 255)
+      // A4 尺寸比例：210 x 297 mm (1:1.414)
+      // 使用較大的尺寸以支援高解析度預覽
+      const a4Width = 595; // A4 在 72 DPI 下的像素寬度
+      const a4Height = 842; // A4 在 72 DPI 下的像素高度
       const whitePageSvg = `
-        <svg width="200" height="283" xmlns="http://www.w3.org/2000/svg">
+        <svg width="${a4Width}" height="${a4Height}" xmlns="http://www.w3.org/2000/svg">
           <rect width="100%" height="100%" fill="#FFFFFF" stroke="#CCCCCC" stroke-width="1"/>
         </svg>
       `;
@@ -1088,7 +1091,7 @@ export default function Home() {
                 </Document>
               ) : (
                 <div className="page-preview-canvas" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
-                  <div style={{ width: '200px', height: '283px' }}>
+                  <div style={{ width: `${595 * previewZoom}px`, height: `${842 * previewZoom}px`, maxWidth: '100%', maxHeight: '100%' }}>
                     <img src={previewedPage.preview} alt="空白頁面預覽" style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
                   </div>
                 </div>
