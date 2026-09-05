@@ -721,6 +721,27 @@ export default function Home() {
     toast.success("已複製頁面。", { description: "複本已插入於原始頁面的下一頁。" });
   };
 
+  const addBlankPage = (pageIndex: number) => {
+    setPages((current) => {
+      const nextPages = [...current];
+      // 取得前一頁的資訊來建立空白頁（使用相同的 sourceId 和 rotation）
+      const prevPage = pages[pageIndex];
+      const blankPage: PdfPageItem = {
+        id: createPageId(),
+        sourceId: prevPage?.sourceId ?? "",
+        sourceIndex: prevPage?.sourceIndex ?? 0,
+        sourceRotation: prevPage?.sourceRotation ?? 0,
+        preview: "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjI4MyIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjZjVmNWY1IiBzdHJva2U9IiNkMWQxZDEiIHN0cm9rZS1kYXNoYXJyYXk9IjQgNCIvPjx0ZXh0IHg9IjUwJSIgeT0iNTAlIiBmb250LWZhbWlseT0ic2Fucy1zZXJpZiIgZm9udC1zaXplPSIxNCIgZmlsbD0iIzlhOWE5YSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZHk9Ii4zZW0iPuW+hee7nC9ibGFuayBwYWdlPC90ZXh0Pjwvc3ZnPg==",
+        rotation: 0,
+        textAnnotations: [],
+      };
+      nextPages.splice(pageIndex + 1, 0, blankPage);
+      return nextPages;
+    });
+    setSplitPoints((current) => current.map((point) => (point >= pageIndex + 1 ? point + 1 : point)));
+    toast.success("已新增空白頁面。", { description: "空白頁已插入於目前頁面的下一頁。" });
+  };
+
   const deletePage = (pageIndex: number) => {
     const deletedPage = pages[pageIndex];
     if (!deletedPage) return;
@@ -925,6 +946,7 @@ export default function Home() {
                           <PageQuickAction tooltip="放大預覽" icon={<Search size={17} />} onClick={() => openPagePreview(page.id)} />
                           <PageQuickAction tooltip="向右旋轉 90°" icon={<RotateCw size={17} />} onClick={() => rotatePage(page.id)} />
                           <PageQuickAction tooltip="複製此頁" icon={<Copy size={16} />} onClick={() => duplicatePage(index)} />
+                          <PageQuickAction tooltip="新增空白頁" icon={<Plus size={16} />} onClick={() => addBlankPage(index)} />
                           <PageQuickAction tooltip="刪除此頁" icon={<Trash2 size={17} />} onClick={() => deletePage(index)} danger />
                         </div>
                         <div className="page-image-wrap"><img src={page.preview} alt={`第 ${pageNumber} 頁縮圖`} style={{ transform: `rotate(${page.rotation}deg)` }} /></div>
