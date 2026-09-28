@@ -1,5 +1,5 @@
 /**
- * 藍圖工作台：移除全螢幕預覽與文字編輯功能，保留核心的 PDF 分割、重排與匯出流程。
+ * 藍圖工作台：所有狀態皆以工程尺規、頁間剪刀節點與可預見頁軌呈現；工程藍只用於精確的切點與主要操作。
  */
 import { toast } from "sonner";
 import {
@@ -12,22 +12,39 @@ import {
   GripVertical,
   List,
   Loader2,
+  Minus,
+  Plus,
   RotateCw,
   Scissors,
+  Search,
   Sparkles,
+  TextCursorInput,
   Trash2,
   UploadCloud,
   X,
 } from "lucide-react";
-import { Fragment, type ChangeEvent, type DragEvent, useCallback, useRef, useState } from "react";
-import { PDFDocument } from "pdf-lib";
+import { Fragment, type ChangeEvent, type DragEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { degrees, PDFDocument, rgb, StandardFonts, type PDFFont, type PDFPage } from "pdf-lib";
+import fontkit from "@pdf-lib/fontkit";
 import JSZip from "jszip";
+// 修復：pdfjs-dist v4+ 移除了 legacy 目錄，改為直接匯入主模組與正確的 worker 路徑
+import * as pdfjsLib from "pdfjs-dist";
+import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import { Document, Page, pdfjs } from "react-pdf";
+import "react-pdf/dist/Page/AnnotationLayer.css";
+import "react-pdf/dist/Page/TextLayer.css";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, useDialogComposition } from "@/components/ui/dialog";
+
+// 統一設定 worker 來源，確保 pdfjsLib 與 react-pdf 都能正確使用 worker
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
 // 修改這三行，加入 BASE_URL
 const BASE_URL = import.meta.env.BASE_URL;
 const LOGO_URL = `${BASE_URL}manus-storage/pdf-splitter-logo_e764a730.png`;
 const WORKSPACE_ART_URL = `${BASE_URL}manus-storage/blueprint-workspace_7ab3ecdf.png`;
+
 
 type ToolButtonProps = {
   label: string;
@@ -45,6 +62,7 @@ type PdfPageItem = {
   sourceRotation: number;
   preview: string;
   rotation: number;
+  textAnnotations: PdfTextAnnotation[];
 };
 
 type PdfSource = {
@@ -53,9 +71,111 @@ type PdfSource = {
   bytes: Uint8Array;
 };
 
+type PdfTextFont = "sans" | "serif" | "mono";
+
+type PdfTextAnnotation = {
+  id: string;
+  text: string;
+  x: number;
+  y: number;
+  fontSize: number;
+  fontFamily: PdfTextFont;
+};
+
+type TextAnnotationDragState = {
+  annotationId: string;
+  pointerId: number;
+  grabOffsetX: number;
+  grabOffsetY: number;
+  elementHeight: number;
+};
+
+type DeletedTextAnnotation = {
+  pageId: string;
+  annotation: PdfTextAnnotation;
+  index: number;
+};
+
+type PdfJsPageForTextPlacement = {
+  getViewport: (options: { scale: number; rotation: number }) => {
+    width: number;
+    height: number;
+    convertToPdfPoint: (x: number, y: number) => number[];
+  };
+};
+
+type PdfTextFontBundle = Record<PdfTextFont, PDFFont> & { cjk: PDFFont };
+
+const PREVIEW_ZOOM_MIN = 0.5;
+const PREVIEW_ZOOM_MAX = 2.5;
+const PREVIEW_ZOOM_STEP = 0.25;
+const DEFAULT_TEXT_CONTENT = "輸入文字";
+const DEFAULT_TEXT_FONT_SIZE = 18;
+const PDF_CJK_FONT_URL = `${BASE_URL}manus-storage/pdf-studio-cjk_7e82ee53.ttf`;
+let cjkFontBytesPromise: Promise<ArrayBuffer> | null = null;
+
+const TEXT_FONT_OPTIONS: Array<{ value: PdfTextFont; label: string; cssFamily: string }> = [
+  { value: "sans", label: "無襯線", cssFamily: '"Helvetica Neue", Arial, sans-serif' },
+  { value: "serif", label: "襯線", cssFamily: 'Georgia, "Times New Roman", serif' },
+  { value: "mono", label: "等寬", cssFamily: '"SFMono-Regular", Consolas, monospace' },
+];
+
 const createPageId = () => (
   globalThis.crypto?.randomUUID?.() ?? `page-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`
 );
+
+const getTextFontCssFamily = (fontFamily: PdfTextFont) => (
+  TEXT_FONT_OPTIONS.find((option) => option.value === fontFamily)?.cssFamily ?? TEXT_FONT_OPTIONS[0].cssFamily
+);
+
+const getCjkFontBytes = () => {
+  if (!cjkFontBytesPromise) {
+    cjkFontBytesPromise = fetch(PDF_CJK_FONT_URL).then(async (response) => {
+      if (!response.ok) throw new Error("無法載入 PDF 中文字型");
+      return response.arrayBuffer();
+    });
+  }
+  return cjkFontBytesPromise;
+};
+
+const embedTextFonts = async (document: PDFDocument): Promise<PdfTextFontBundle> => {
+  document.registerFontkit(fontkit);
+  const cjk = await document.embedFont(await getCjkFontBytes(), { subset: true });
+  return {
+    sans: await document.embedFont(StandardFonts.Helvetica),
+    serif: await document.embedFont(StandardFonts.TimesRoman),
+    mono: await document.embedFont(StandardFonts.Courier),
+    cjk,
+  };
+};
+
+function drawTextAnnotations(
+  targetPage: PDFPage,
+  sourcePage: PdfJsPageForTextPlacement,
+  annotations: PdfTextAnnotation[],
+  rotation: number,
+  fonts: PdfTextFontBundle,
+) {
+  if (annotations.length === 0) return;
+  const viewport = sourcePage.getViewport({ scale: 1, rotation });
+
+  annotations.forEach((annotation) => {
+    const [x = 0, y = 0] = viewport.convertToPdfPoint(annotation.x * viewport.width, annotation.y * viewport.height);
+    const text = annotation.text || DEFAULT_TEXT_CONTENT;
+    const font = /[^\u0000-\u00ff]/.test(text) ? fonts.cjk : fonts[annotation.fontFamily];
+    const lineHeight = annotation.fontSize * 1.25;
+    text.split(/\r?\n/).forEach((line, lineIndex) => {
+      targetPage.drawText(line || " ", {
+        x,
+        y: y - annotation.fontSize - lineIndex * lineHeight,
+        size: annotation.fontSize,
+        font,
+        color: rgb(0.09, 0.13, 0.2),
+        lineHeight,
+      });
+    });
+  });
+}
 
 function ToolButton({ label, tooltip, icon, active, disabled, onClick }: ToolButtonProps) {
   return (
@@ -97,14 +217,108 @@ function PageQuickAction({ tooltip, icon, onClick, disabled, danger }: { tooltip
   );
 }
 
+function PreviewControlButton({ label, icon, onClick, active, disabled }: { label: string; icon: React.ReactNode; onClick: () => void; active?: boolean; disabled?: boolean }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="inline-flex">
+          <button type="button" className={`preview-control-button ${active ? "preview-control-button-active" : ""}`} aria-label={label} aria-pressed={active} disabled={disabled} onClick={onClick}>
+            {icon}
+          </button>
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={8} className="font-[Manrope] text-[11px] font-semibold">{label}</TooltipContent>
+    </Tooltip>
+  );
+}
+
 function formatFileSize(bytes: number) {
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+function InlineEditableTextAnnotation({ annotation, style, editorRef, formatControlsRef, onFinish, onDelete }: {
+  annotation: PdfTextAnnotation;
+  style: React.CSSProperties;
+  editorRef: React.RefObject<HTMLDivElement | null>;
+  formatControlsRef: React.RefObject<HTMLDivElement | null>;
+  onFinish: (value?: string) => void;
+  onDelete: () => void;
+}) {
+  const { setComposing, markCompositionEnd, justEndedComposing } = useDialogComposition();
+  const [isComposing, setIsComposing] = useState(false);
+
+  useEffect(() => {
+    const placeCaretAtEnd = () => {
+      const element = editorRef.current;
+      if (!element) return;
+      element.focus({ preventScroll: true });
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.setStart(element, element.childNodes.length);
+      range.collapse(false);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    };
+
+    placeCaretAtEnd();
+    const animationFrame = window.requestAnimationFrame(placeCaretAtEnd);
+    const timer = window.setTimeout(placeCaretAtEnd, 0);
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      window.clearTimeout(timer);
+    };
+  }, [editorRef]);
+
+  return (
+    <div
+      ref={editorRef}
+      className="text-annotation text-annotation-editing text-annotation-selected"
+      style={style}
+      contentEditable
+      suppressContentEditableWarning
+      role="textbox"
+      aria-multiline="true"
+      aria-label="直接編輯已放置的文字"
+      onPointerDown={(event) => event.stopPropagation()}
+      onBlur={(event) => {
+        const nextFocus = event.relatedTarget as Node | null;
+        if (nextFocus && formatControlsRef.current?.contains(nextFocus)) return;
+        onFinish(event.currentTarget.innerText ?? "");
+      }}
+      onCompositionStart={() => { setIsComposing(true); setComposing(true); }}
+      onCompositionEnd={() => {
+        markCompositionEnd();
+        window.setTimeout(() => { setIsComposing(false); setComposing(false); }, 100);
+      }}
+      onKeyDown={(event) => {
+        const composing = event.nativeEvent.isComposing || isComposing || justEndedComposing();
+        if (event.key === "Enter" && !event.shiftKey && !composing) {
+          event.preventDefault();
+          onFinish(event.currentTarget.innerText ?? "");
+        }
+        if (event.key === "Escape" && !composing) {
+          event.preventDefault();
+          onFinish();
+        }
+        if (event.key === "Delete" && !composing) {
+          event.preventDefault();
+          onDelete();
+        }
+      }}
+    >
+      {annotation.text || DEFAULT_TEXT_CONTENT}
+    </div>
+  );
+}
+
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
+  const previewViewportRef = useRef<HTMLDivElement>(null);
+  const inlineTextElementRef = useRef<HTMLDivElement>(null);
+  const inlineTextFormatControlsRef = useRef<HTMLDivElement>(null);
+  const textAnnotationLayerRef = useRef<HTMLDivElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [pdfSources, setPdfSources] = useState<PdfSource[]>([]);
   const [pages, setPages] = useState<PdfPageItem[]>([]);
@@ -114,16 +328,188 @@ export default function Home() {
   const [isExporting, setIsExporting] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [viewMode, setViewMode] = useState<"grid" | "order">("grid");
+  const [previewedPageId, setPreviewedPageId] = useState<string | null>(null);
+  const [previewZoom, setPreviewZoom] = useState(1);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+  const [previewLoadError, setPreviewLoadError] = useState(false);
+  const [isTextEditing, setIsTextEditing] = useState(false);
+  const [selectedTextAnnotationId, setSelectedTextAnnotationId] = useState<string | null>(null);
+  const [inlineTextAnnotationId, setInlineTextAnnotationId] = useState<string | null>(null);
+  const [draggingTextAnnotation, setDraggingTextAnnotation] = useState<TextAnnotationDragState | null>(null);
+  const [lastDeletedTextAnnotation, setLastDeletedTextAnnotation] = useState<DeletedTextAnnotation | null>(null);
+  const [textFontFamily, setTextFontFamily] = useState<PdfTextFont>("sans");
+  const [textFontSize, setTextFontSize] = useState(DEFAULT_TEXT_FONT_SIZE);
   const [draggedPageId, setDraggedPageId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; position: "before" | "after" } | null>(null);
 
   const pageCount = pages.length;
+  const previewedPage = pages.find((page) => page.id === previewedPageId) ?? null;
+  const previewedPageNumber = previewedPage ? pages.findIndex((page) => page.id === previewedPage.id) + 1 : 0;
+  const previewSource = previewedPage ? pdfSources.find((source) => source.id === previewedPage.sourceId) ?? null : null;
+  const previewDocumentFile = useMemo(() => previewSource ? { data: previewSource.bytes.slice() } : null, [previewSource]);
+  const previewPercent = Math.round(previewZoom * 100);
+
+  useEffect(() => {
+    if (!previewedPageId) return;
+    const animationFrame = window.requestAnimationFrame(() => previewViewportRef.current?.scrollTo({ left: 0, top: 0 }));
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [previewedPageId]);
+
+  useEffect(() => {
+    if (!lastDeletedTextAnnotation || inlineTextAnnotationId || previewedPageId !== lastDeletedTextAnnotation.pageId) return;
+    const handleUndoDelete = (event: KeyboardEvent) => {
+      if ((!event.ctrlKey && !event.metaKey) || event.shiftKey || event.key.toLowerCase() !== "z") return;
+      event.preventDefault();
+      const deleted = lastDeletedTextAnnotation;
+      setPages((current) => current.map((page) => {
+        if (page.id !== deleted.pageId || page.textAnnotations.some((annotation) => annotation.id === deleted.annotation.id)) return page;
+        const textAnnotations = [...page.textAnnotations];
+        textAnnotations.splice(Math.min(deleted.index, textAnnotations.length), 0, deleted.annotation);
+        return { ...page, textAnnotations };
+      }));
+      setSelectedTextAnnotationId(deleted.annotation.id);
+      setLastDeletedTextAnnotation(null);
+      toast.success("已復原刪除的文字。", { description: "文字已回到原本的位置。" });
+    };
+    window.addEventListener("keydown", handleUndoDelete);
+    return () => window.removeEventListener("keydown", handleUndoDelete);
+  }, [inlineTextAnnotationId, lastDeletedTextAnnotation, previewedPageId]);
+
+  const openPagePreview = (pageId: string) => {
+    setPreviewZoom(1);
+    setPreviewLoadError(false);
+    setIsPreviewLoading(true);
+    setPreviewedPageId(pageId);
+  };
+
+  const adjustPreviewZoom = (amount: number) => {
+    setPreviewZoom((current) => Math.min(PREVIEW_ZOOM_MAX, Math.max(PREVIEW_ZOOM_MIN, Number((current + amount).toFixed(2)))));
+    setIsPreviewLoading(true);
+  };
+
+  const updateSelectedTextAnnotation = (changes: Partial<Pick<PdfTextAnnotation, "text" | "fontFamily" | "fontSize">>) => {
+    if (!previewedPageId || !selectedTextAnnotationId) return;
+    setPages((current) => current.map((page) => (
+      page.id === previewedPageId
+        ? { ...page, textAnnotations: page.textAnnotations.map((annotation) => annotation.id === selectedTextAnnotationId ? { ...annotation, ...changes } : annotation) }
+        : page
+    )));
+  };
+
+  const handleTextFontChange = (value: PdfTextFont) => {
+    setTextFontFamily(value);
+    updateSelectedTextAnnotation({ fontFamily: value });
+  };
+
+  const handleTextFontSizeChange = (value: number) => {
+    const nextValue = Math.min(72, Math.max(8, Number.isFinite(value) ? value : DEFAULT_TEXT_FONT_SIZE));
+    setTextFontSize(nextValue);
+    updateSelectedTextAnnotation({ fontSize: nextValue });
+  };
+
+  const addTextAnnotation = () => {
+    if (!isTextEditing || !previewedPageId) return;
+    const annotation: PdfTextAnnotation = {
+      id: createPageId(),
+      text: DEFAULT_TEXT_CONTENT,
+      x: 0.5,
+      y: 0.5,
+      fontFamily: textFontFamily,
+      fontSize: textFontSize,
+    };
+    setPages((current) => current.map((page) => page.id === previewedPageId ? { ...page, textAnnotations: [...page.textAnnotations, annotation] } : page));
+    setSelectedTextAnnotationId(annotation.id);
+    setInlineTextAnnotationId(annotation.id);
+  };
+
+  const selectTextAnnotation = (annotation: PdfTextAnnotation) => {
+    setSelectedTextAnnotationId(annotation.id);
+    setTextFontFamily(annotation.fontFamily);
+    setTextFontSize(annotation.fontSize);
+  };
+
+  const beginInlineTextEdit = (annotation: PdfTextAnnotation) => {
+    selectTextAnnotation(annotation);
+    setInlineTextAnnotationId(annotation.id);
+  };
+
+  const finishInlineTextEdit = (value?: string) => {
+    if (value !== undefined) {
+      const nextValue = value.trim() || DEFAULT_TEXT_CONTENT;
+      updateSelectedTextAnnotation({ text: nextValue });
+    }
+    setInlineTextAnnotationId(null);
+  };
+
+  const updateTextAnnotationPosition = (annotationId: string, x: number, y: number) => {
+    if (!previewedPageId) return;
+    setPages((current) => current.map((page) => (
+      page.id === previewedPageId
+        ? { ...page, textAnnotations: page.textAnnotations.map((annotation) => annotation.id === annotationId ? { ...annotation, x, y } : annotation) }
+        : page
+    )));
+  };
+
+  const startTextAnnotationDrag = (event: ReactPointerEvent<HTMLButtonElement>, annotation: PdfTextAnnotation) => {
+    if (!isTextEditing || event.button !== 0 || inlineTextAnnotationId === annotation.id) return;
+    const layerBounds = textAnnotationLayerRef.current?.getBoundingClientRect();
+    const textBounds = event.currentTarget.getBoundingClientRect();
+    if (!layerBounds || layerBounds.width === 0 || layerBounds.height === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    selectTextAnnotation(annotation);
+    setDraggingTextAnnotation({
+      annotationId: annotation.id,
+      pointerId: event.pointerId,
+      grabOffsetX: event.clientX - textBounds.left,
+      grabOffsetY: event.clientY - textBounds.top,
+      elementHeight: textBounds.height,
+    });
+  };
+
+  const moveTextAnnotation = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!draggingTextAnnotation || event.pointerId !== draggingTextAnnotation.pointerId) return;
+    const layerBounds = textAnnotationLayerRef.current?.getBoundingClientRect();
+    if (!layerBounds || layerBounds.width === 0 || layerBounds.height === 0) return;
+    event.preventDefault();
+    const x = Math.min(0.96, Math.max(0.02, (event.clientX - layerBounds.left - draggingTextAnnotation.grabOffsetX) / layerBounds.width));
+    const y = Math.min(0.98, Math.max(0.04, (event.clientY - layerBounds.top - draggingTextAnnotation.grabOffsetY + draggingTextAnnotation.elementHeight) / layerBounds.height));
+    updateTextAnnotationPosition(draggingTextAnnotation.annotationId, x, y);
+  };
+
+  const finishTextAnnotationDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!draggingTextAnnotation || event.pointerId !== draggingTextAnnotation.pointerId) return;
+    event.preventDefault();
+    setDraggingTextAnnotation(null);
+  };
+
+  const deleteSelectedTextAnnotation = () => {
+    if (!previewedPageId || !selectedTextAnnotationId || inlineTextAnnotationId !== selectedTextAnnotationId) return;
+    const deletedIndex = previewedPage?.textAnnotations.findIndex((annotation) => annotation.id === selectedTextAnnotationId) ?? -1;
+    const deletedAnnotation = deletedIndex >= 0 ? previewedPage?.textAnnotations[deletedIndex] : null;
+    if (!deletedAnnotation) return;
+    setLastDeletedTextAnnotation({ pageId: previewedPageId, annotation: deletedAnnotation, index: deletedIndex });
+    setPages((current) => current.map((page) => (
+      page.id === previewedPageId
+        ? { ...page, textAnnotations: page.textAnnotations.filter((annotation) => annotation.id !== selectedTextAnnotationId) }
+        : page
+    )));
+    setSelectedTextAnnotationId(null);
+    setInlineTextAnnotationId(null);
+    toast.message("文字已刪除。", { description: "按 Ctrl/Cmd+Z 可復原。" });
+  };
 
   const clearFile = () => {
     setFile(null);
     setPdfSources([]);
     setPages([]);
     setSplitPoints([]);
+    setPreviewedPageId(null);
+    setIsTextEditing(false);
+    setSelectedTextAnnotationId(null);
+    setInlineTextAnnotationId(null);
+    setLastDeletedTextAnnotation(null);
     if (inputRef.current) inputRef.current.value = "";
     if (importInputRef.current) importInputRef.current.value = "";
   };
@@ -140,10 +526,8 @@ export default function Home() {
 
     try {
       const sourceBytes = new Uint8Array(await selectedFile.arrayBuffer());
-      
-      // 使用動態 import 避免在非預覽模式下加載過大的 pdfjs-dist
-      const pdfjsLib = await import("pdfjs-dist/legacy/build/pdf.mjs");
-      const loadingTask = pdfjsLib.getDocument({ data: sourceBytes.slice() });
+      // 修復：移除 sourceBytes.slice()，直接傳遞 Uint8Array 實例
+      const loadingTask = pdfjsLib.getDocument({ data: sourceBytes });
       const pdf = await loadingTask.promise;
       const sourceId = createPageId();
 
@@ -156,7 +540,7 @@ export default function Home() {
         if (!context) continue;
         canvas.width = Math.ceil(viewport.width);
         canvas.height = Math.ceil(viewport.height);
-        await page.render({ canvasContext: context, viewport }).promise;
+        await page.render({ canvas, canvasContext: context, viewport }).promise;
         previews.push({
           id: createPageId(),
           sourceId,
@@ -164,6 +548,7 @@ export default function Home() {
           sourceRotation: ((page.rotate % 360) + 360) % 360,
           preview: canvas.toDataURL("image/jpeg", 0.78),
           rotation: 0,
+          textAnnotations: [],
         });
       }
 
@@ -217,6 +602,8 @@ export default function Home() {
     setIsSplitting(true);
     try {
       const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes)] as const)));
+      // 修復：移除 source.bytes.slice()
+      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes }).promise] as const)));
       const baseName = file.name.replace(/\.pdf$/i, "") || "split-document";
       const zip = new JSZip();
       const boundaries = [0, ...selectedSplitPoints, pageCount];
@@ -225,15 +612,19 @@ export default function Home() {
         const startPage = boundaries[index];
         const endPage = boundaries[index + 1];
         const segmentPdf = await PDFDocument.create();
+        const textFonts = await embedTextFonts(segmentPdf);
         const segmentItems = selectedPages.slice(startPage, endPage);
-        
         for (const pageItem of segmentItems) {
           const source = sourceDocuments.get(pageItem.sourceId);
           if (!source) throw new Error("找不到頁面來源");
           const [page] = await segmentPdf.copyPages(source, [pageItem.sourceIndex]);
-          // 注意：移除了文字註記繪製邏輯，僅保留旋轉
           const rotation = (page.getRotation().angle + pageItem.rotation) % 360;
-          page.setRotation(rotation); 
+          page.setRotation(degrees(rotation));
+          const sourceRenderDocument = sourceRenderDocuments.get(pageItem.sourceId);
+          if (sourceRenderDocument) {
+            const sourceRenderPage = await sourceRenderDocument.getPage(pageItem.sourceIndex + 1);
+            drawTextAnnotations(page, sourceRenderPage, pageItem.textAnnotations, rotation, textFonts);
+          }
           segmentPdf.addPage(page);
         }
 
@@ -259,7 +650,7 @@ export default function Home() {
       toast.success("ZIP 壓縮檔已準備完成。", { description: `壓縮檔內包含 ${selectedSplitPoints.length + 1} 份分拆後的 PDF，下載將由瀏覽器自動開始。` });
     } catch (error) {
       console.error(error);
-      toast.error("拆分時發生問題。", { description: "請重新嘗試，或改用另一份 PDF。" });
+          toast.error("拆分時發生問題。", { description: "請重新嘗試，或改用另一份 PDF。" });
     } finally {
       setIsSplitting(false);
     }
@@ -270,14 +661,21 @@ export default function Home() {
     setIsExporting(true);
     try {
       const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes)] as const)));
+      // 修復：移除 source.bytes.slice()
+      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes }).promise] as const)));
       const exportedPdf = await PDFDocument.create();
-      
+      const textFonts = await embedTextFonts(exportedPdf);
       for (const pageItem of pages) {
         const source = sourceDocuments.get(pageItem.sourceId);
         if (!source) throw new Error("找不到頁面來源");
         const [page] = await exportedPdf.copyPages(source, [pageItem.sourceIndex]);
         const rotation = (page.getRotation().angle + pageItem.rotation) % 360;
-        page.setRotation(rotation);
+        page.setRotation(degrees(rotation));
+        const sourceRenderDocument = sourceRenderDocuments.get(pageItem.sourceId);
+        if (sourceRenderDocument) {
+          const sourceRenderPage = await sourceRenderDocument.getPage(pageItem.sourceIndex + 1);
+          drawTextAnnotations(page, sourceRenderPage, pageItem.textAnnotations, rotation, textFonts);
+        }
         exportedPdf.addPage(page);
       }
 
@@ -290,7 +688,7 @@ export default function Home() {
       link.click();
       link.remove();
       window.setTimeout(() => URL.revokeObjectURL(fileUrl), 800);
-      toast.success("PDF 已匯出。", { description: "目前頁序與旋轉設定已寫入下載檔案。" });
+      toast.success("PDF 已匯出。", { description: "目前頁序與所有頁面編輯已寫入下載檔案。" });
     } catch (error) {
       console.error(error);
       toast.error("匯出時發生問題。", { description: "請重新嘗試匯出目前文件。" });
@@ -324,7 +722,7 @@ export default function Home() {
     if (!copiedPage) return;
     setPages((current) => {
       const nextPages = [...current];
-      nextPages.splice(pageIndex + 1, 0, { ...copiedPage, id: createPageId() });
+      nextPages.splice(pageIndex + 1, 0, { ...copiedPage, id: createPageId(), textAnnotations: copiedPage.textAnnotations.map((annotation) => ({ ...annotation, id: createPageId() })) });
       return nextPages;
     });
     setSplitPoints((current) => current.map((point) => (point >= pageIndex + 1 ? point + 1 : point)));
@@ -337,6 +735,7 @@ export default function Home() {
     if (pages.length === 1) {
       setPages([]);
       setSplitPoints([]);
+      setPreviewedPageId(null);
       toast.success("已清空工作區。", { description: "你可以使用匯入按鈕繼續加入更多 PDF。" });
       return;
     }
@@ -344,6 +743,7 @@ export default function Home() {
     setSplitPoints((current) => current
       .filter((point) => point !== pageIndex + 1)
       .map((point) => (point > pageIndex + 1 ? point - 1 : point)));
+    if (previewedPageId === deletedPage.id) setPreviewedPageId(null);
     toast.success("已刪除頁面。", { description: "相關切點已自動調整。" });
   };
 
@@ -530,7 +930,7 @@ export default function Home() {
                       <article className="page-card">
                         <div className="page-topline"><span className="page-topline-label"><GripVertical className="page-drag-handle" size={13} /><span>PAGE {String(pageNumber).padStart(2, "0")}</span></span><span className="page-dot" /></div>
                         <div className="page-card-hover-tools" aria-label={`第 ${pageNumber} 頁操作`}>
-                          {/* 已移除放大預覽按鈕 */}
+                          <PageQuickAction tooltip="放大預覽" icon={<Search size={17} />} onClick={() => openPagePreview(page.id)} />
                           <PageQuickAction tooltip="向右旋轉 90°" icon={<RotateCw size={17} />} onClick={() => rotatePage(page.id)} />
                           <PageQuickAction tooltip="複製此頁" icon={<Copy size={16} />} onClick={() => duplicatePage(index)} />
                           <PageQuickAction tooltip="刪除此頁" icon={<Trash2 size={17} />} onClick={() => deletePage(index)} danger />
@@ -578,8 +978,100 @@ export default function Home() {
           </section>
         </main>
       )}
-      
-      {/* 已移除全螢幕預覽 Dialog */}
+
+      <Dialog open={previewedPage !== null} onOpenChange={(open) => {
+        if (!open) {
+          setPreviewedPageId(null);
+          setIsTextEditing(false);
+          setSelectedTextAnnotationId(null);
+          setInlineTextAnnotationId(null);
+        }
+      }}>
+        {previewedPage && (
+          <DialogContent fullscreen className="page-preview-dialog page-preview-fullscreen">
+            <DialogHeader className="page-preview-header pr-14">
+              <DialogTitle className="font-[Manrope] text-[18px] font-extrabold tracking-[-0.03em]">第 {previewedPageNumber} 頁預覽</DialogTitle>
+              <DialogDescription>全螢幕預覽目前頁面；關閉後可返回 PDF 工作區繼續編輯。</DialogDescription>
+              <div className="preview-controls" role="toolbar" aria-label="預覽縮放控制">
+                <div className="preview-control-group">
+                  <PreviewControlButton label={isTextEditing ? "結束文字編輯" : "文字編輯"} icon={<TextCursorInput size={16} />} active={isTextEditing} onClick={() => { setIsTextEditing((current) => !current); setSelectedTextAnnotationId(null); setInlineTextAnnotationId(null); setDraggingTextAnnotation(null); }} />
+                  <PreviewControlButton label="縮小" icon={<Minus size={17} />} disabled={previewZoom <= PREVIEW_ZOOM_MIN} onClick={() => adjustPreviewZoom(-PREVIEW_ZOOM_STEP)} />
+                  <span className="preview-zoom-value" aria-label={`目前縮放 ${previewPercent}%`}>{previewPercent}%</span>
+                  <PreviewControlButton label="放大" icon={<Plus size={17} />} disabled={previewZoom >= PREVIEW_ZOOM_MAX} onClick={() => adjustPreviewZoom(PREVIEW_ZOOM_STEP)} />
+                </div>
+              </div>
+              {isTextEditing && (
+                <div className="preview-text-editor" aria-label="文字編輯設定">
+                  <span className="preview-edit-hint">按「+」新增「輸入文字」 · 拖曳移動 · 雙點文字編輯 · Shift+Enter 換行 · 修改中按 Delete 刪除</span>
+                  {inlineTextAnnotationId && <div ref={inlineTextFormatControlsRef} className="inline-text-format-controls">
+                    <label className="preview-text-field"><span>字型</span><select value={textFontFamily} onChange={(event) => handleTextFontChange(event.target.value as PdfTextFont)} aria-label="字型">
+                      {TEXT_FONT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                    </select></label>
+                    <label className="preview-text-field preview-text-size"><span>字級</span><input type="number" min="8" max="72" value={textFontSize} onChange={(event) => handleTextFontSizeChange(Number(event.target.value))} aria-label="字級" /></label>
+                  </div>}
+                  <button type="button" className="preview-text-add" onClick={addTextAnnotation} aria-label="新增文字至頁面中央"><Plus size={14} /><span>新增文字</span></button>
+                </div>
+              )}
+            </DialogHeader>
+            <div ref={previewViewportRef} className="page-preview-canvas react-pdf-preview" aria-busy={isPreviewLoading} aria-label="可捲動的完整 PDF 頁面預覽" tabIndex={0}>
+              {previewDocumentFile && (
+                <Document
+                  file={previewDocumentFile}
+                  loading={<div className="preview-render-status"><Loader2 className="animate-spin" size={19} /><span>正在載入原始 PDF 頁面</span></div>}
+                  error={<div className="preview-render-status preview-render-status-error">無法載入這一頁，請關閉後再試。</div>}
+                  onLoadError={(error) => { console.error(error); setPreviewLoadError(true); setIsPreviewLoading(false); }}
+                >
+                  <div className={`page-edit-stage ${isTextEditing ? "page-edit-stage-editing" : ""}`}>
+                    <Page
+                      pageNumber={previewedPage.sourceIndex + 1}
+                      rotate={(previewedPage.sourceRotation + previewedPage.rotation) % 360}
+                      scale={Number.isFinite(previewZoom) && previewZoom > 0 ? previewZoom : 1}
+                      devicePixelRatio={Math.min(globalThis.devicePixelRatio || 1, 2)}
+                      renderAnnotationLayer
+                      renderTextLayer
+                      loading={<div className="preview-render-status"><Loader2 className="animate-spin" size={19} /><span>正在以向量品質繪製頁面</span></div>}
+                      error={<div className="preview-render-status preview-render-status-error">此頁無法完成渲染。</div>}
+                      onRenderSuccess={() => setIsPreviewLoading(false)}
+                      onRenderError={(error) => { console.error(error); setPreviewLoadError(true); setIsPreviewLoading(false); }}
+                    />
+                    <div ref={textAnnotationLayerRef} className="text-annotation-layer" onPointerMove={moveTextAnnotation} onPointerUp={finishTextAnnotationDrag} onPointerCancel={finishTextAnnotationDrag}>
+                      {previewedPage.textAnnotations.map((annotation) => {
+                        const annotationStyle = { left: `${annotation.x * 100}%`, top: `${annotation.y * 100}%`, fontSize: `${annotation.fontSize * previewZoom}px`, fontFamily: getTextFontCssFamily(annotation.fontFamily) };
+                        const isInlineEditing = inlineTextAnnotationId === annotation.id;
+                        return isInlineEditing ? (
+                          <InlineEditableTextAnnotation
+                            key={annotation.id}
+                            annotation={annotation}
+                            style={annotationStyle}
+                            editorRef={inlineTextElementRef}
+                            formatControlsRef={inlineTextFormatControlsRef}
+                            onFinish={finishInlineTextEdit}
+                            onDelete={deleteSelectedTextAnnotation}
+                          />
+                        ) : (
+                          <button
+                            key={annotation.id}
+                            type="button"
+                            className={`text-annotation ${selectedTextAnnotationId === annotation.id ? "text-annotation-selected" : ""} ${draggingTextAnnotation?.annotationId === annotation.id ? "text-annotation-dragging" : ""}`}
+                            style={annotationStyle}
+                            onPointerDown={(event) => startTextAnnotationDrag(event, annotation)}
+                            onDoubleClick={(event) => { if (!isTextEditing) return; event.stopPropagation(); beginInlineTextEdit(annotation); }}
+                            aria-label={`編輯文字：${annotation.text || DEFAULT_TEXT_CONTENT}；可拖曳移動，雙重點擊可直接修改`}
+                          >
+                            {annotation.text || DEFAULT_TEXT_CONTENT}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </Document>
+              )}
+              {previewLoadError && <div className="preview-render-status preview-render-status-error">高解析預覽載入失敗，請關閉後再試。</div>}
+            </div>
+          </DialogContent>
+        )}
+      </Dialog>
+
     </div>
   );
 }
