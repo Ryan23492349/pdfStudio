@@ -27,16 +27,14 @@ import { Fragment, type ChangeEvent, type DragEvent, type PointerEvent as ReactP
 import { degrees, PDFDocument, rgb, StandardFonts, type PDFFont, type PDFPage } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import JSZip from "jszip";
-// 修復：pdfjs-dist v4+ 移除了 legacy 目錄，改為直接匯入主模組與正確的 worker 路徑
-import * as pdfjsLib from "pdfjs-dist";
-import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { Document, Page, pdfjs } from "react-pdf";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, useDialogComposition } from "@/components/ui/dialog";
 
-// 統一設定 worker 來源，確保 pdfjsLib 與 react-pdf 都能正確使用 worker
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
@@ -526,8 +524,7 @@ export default function Home() {
 
     try {
       const sourceBytes = new Uint8Array(await selectedFile.arrayBuffer());
-      // 修復：移除 sourceBytes.slice()，直接傳遞 Uint8Array 實例
-      const loadingTask = pdfjsLib.getDocument({ data: sourceBytes });
+      const loadingTask = pdfjsLib.getDocument({ data: sourceBytes.slice() });
       const pdf = await loadingTask.promise;
       const sourceId = createPageId();
 
@@ -602,8 +599,7 @@ export default function Home() {
     setIsSplitting(true);
     try {
       const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes)] as const)));
-      // 修復：移除 source.bytes.slice()
-      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes }).promise] as const)));
+      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes.slice() }).promise] as const)));
       const baseName = file.name.replace(/\.pdf$/i, "") || "split-document";
       const zip = new JSZip();
       const boundaries = [0, ...selectedSplitPoints, pageCount];
@@ -661,8 +657,7 @@ export default function Home() {
     setIsExporting(true);
     try {
       const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes)] as const)));
-      // 修復：移除 source.bytes.slice()
-      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes }).promise] as const)));
+      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes.slice() }).promise] as const)));
       const exportedPdf = await PDFDocument.create();
       const textFonts = await embedTextFonts(exportedPdf);
       for (const pageItem of pages) {
@@ -991,7 +986,7 @@ export default function Home() {
           <DialogContent fullscreen className="page-preview-dialog page-preview-fullscreen">
             <DialogHeader className="page-preview-header pr-14">
               <DialogTitle className="font-[Manrope] text-[18px] font-extrabold tracking-[-0.03em]">第 {previewedPageNumber} 頁預覽</DialogTitle>
-              <DialogDescription>全螢幕預覽目前頁面；關閉後可返回 PDF 工作區繼續編輯。</DialogDescription>
+              <DialogDescription>全螢幕預覽目前頁面；關閉後可返回 PDF 工作區續編輯。</DialogDescription>
               <div className="preview-controls" role="toolbar" aria-label="預覽縮放控制">
                 <div className="preview-control-group">
                   <PreviewControlButton label={isTextEditing ? "結束文字編輯" : "文字編輯"} icon={<TextCursorInput size={16} />} active={isTextEditing} onClick={() => { setIsTextEditing((current) => !current); setSelectedTextAnnotationId(null); setInlineTextAnnotationId(null); setDraggingTextAnnotation(null); }} />
