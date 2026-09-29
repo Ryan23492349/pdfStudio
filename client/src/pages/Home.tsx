@@ -23,20 +23,16 @@ import {
   UploadCloud,
   X,
 } from "lucide-react";
-import { Fragment, type ChangeEvent, type DragEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type ChangeEvent, type DragEvent, type PointerEvent as ReactPointerEvent, useCallback, useEffect, useRef, useState } from "react";
 import { degrees, PDFDocument, rgb, StandardFonts, type PDFFont, type PDFPage } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import JSZip from "jszip";
 import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
 import pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
-import { Document, Page, pdfjs } from "react-pdf";
-import "react-pdf/dist/Page/AnnotationLayer.css";
-import "react-pdf/dist/Page/TextLayer.css";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, useDialogComposition } from "@/components/ui/dialog";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
-pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
 // 修改這三行，加入 BASE_URL
 const BASE_URL = import.meta.env.BASE_URL;
@@ -314,6 +310,7 @@ export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const previewViewportRef = useRef<HTMLDivElement>(null);
+  const previewCanvasRef = useRef<HTMLCanvasElement>(null);
   const inlineTextElementRef = useRef<HTMLDivElement>(null);
   const inlineTextFormatControlsRef = useRef<HTMLDivElement>(null);
   const textAnnotationLayerRef = useRef<HTMLDivElement>(null);
@@ -344,19 +341,6 @@ export default function Home() {
   const previewedPage = pages.find((page) => page.id === previewedPageId) ?? null;
   const previewedPageNumber = previewedPage ? pages.findIndex((page) => page.id === previewedPage.id) + 1 : 0;
   const previewSource = previewedPage ? pdfSources.find((source) => source.id === previewedPage.sourceId) ?? null : null;
-
-  /**
-   * 修正：pdf.js 在 getDocument() 時會把傳入的 TypedArray 底層 ArrayBuffer「轉移（detach）」給 Worker。
-   * 若沿用 useMemo 快取同一個 Uint8Array，第二次開啟預覧時就會拿到已 detach 的 buffer，
-   * 導致 "Cannot perform Construct on a detached ArrayBuffer"，頁面永遠載入失敗。
-   *
-   * 因此把 previewedPageId 也納入依賴，確保「每次開啟預覧」都產生一份全新的位元組副本。
-   */
-  const previewDocumentFile = useMemo(
-    () => (previewedPageId && previewSource ? { data: previewSource.bytes.slice() } : null),
-    [previewedPageId, previewSource]
-  );
-
   const previewPercent = Math.round(previewZoom * 100);
 
   useEffect(() => {
@@ -364,6 +348,64 @@ export default function Home() {
     const animationFrame = window.requestAnimationFrame(() => previewViewportRef.current?.scrollTo({ left: 0, top: 0 }));
     return () => window.cancelAnimationFrame(animationFrame);
   }, [previewedPageId]);
+
+  // ==========================================================================
+  // 全螢幕預覽：直接使用與縮圖相同的 pdfjsLib 渲染到 canvas。
+  // 不再經過 react-pdf 的 <Document file={{ data }}>，避免 pdf.js 在 transfer
+  // Uint8Array 後、以及 legacy worker 與非 legacy 主執行緒混用時載入失敗。
+  // ==========================================================================
+  useEffect(() => {
+    if (!previewedPage || !previewSource) return;
+    let cancelled = false;
+
+    const renderPreviewPage = async () => {
+      const canvas = previewCanvasRef.current;
+      if (!canvas) return;
+
+      setIsPreviewLoading(true);
+      setPreviewLoadError(false);
+
+      try {
+        // 一律使用獨立副本，避免影響已載入工作區的來源位元組。
+        const pdf = await pdfjsLib.getDocument({ data: previewSource.bytes.slice() }).promise;
+        if (cancelled) return;
+
+        const page = await pdf.getPage(previewedPage.sourceIndex + 1);
+        if (cancelled) return;
+
+        const rotation = (previewedPage.sourceRotation + previewedPage.rotation) % 360;
+        const viewport = page.getViewport({ scale: previewZoom });
+        const outputScale = Math.min(window.devicePixelRatio || 1, 2);
+        const context = canvas.getContext("2d", { alpha: false });
+        if (!context) return;
+
+        canvas.width = Math.max(1, Math.floor(viewport.width * outputScale));
+        canvas.height = Math.max(1, Math.floor(viewport.height * outputScale));
+        canvas.style.width = `${Math.floor(viewport.width)}px`;
+        canvas.style.height = `${Math.floor(viewport.height)}px`;
+
+        await page.render({
+          canvasContext: context,
+          viewport,
+          transform: outputScale === 1 ? undefined : [outputScale, 0, 0, outputScale, 0, 0],
+        }).promise;
+
+        if (cancelled) return;
+        setIsPreviewLoading(false);
+      } catch (error) {
+        if (cancelled) return;
+        console.error(error);
+        setPreviewLoadError(true);
+        setIsPreviewLoading(false);
+      }
+    };
+
+    void renderPreviewPage();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [previewedPage, previewSource, previewZoom]);
 
   useEffect(() => {
     if (!lastDeletedTextAnnotation || inlineTextAnnotationId || previewedPageId !== lastDeletedTextAnnotation.pageId) return;
@@ -394,7 +436,6 @@ export default function Home() {
 
   const adjustPreviewZoom = (amount: number) => {
     setPreviewZoom((current) => Math.min(PREVIEW_ZOOM_MAX, Math.max(PREVIEW_ZOOM_MIN, Number((current + amount).toFixed(2)))));
-    setIsPreviewLoading(true);
   };
 
   const updateSelectedTextAnnotation = (changes: Partial<Pick<PdfTextAnnotation, "text" | "fontFamily" | "fontSize">>) => {
@@ -658,7 +699,7 @@ export default function Home() {
       toast.success("ZIP 壓縮檔已準備完成。", { description: `壓縮檔內包含 ${selectedSplitPoints.length + 1} 份分拆後的 PDF，下載將由瀏覽器自動開始。` });
     } catch (error) {
       console.error(error);
-          toast.error("拆分時發生問題。", { description: "請重新嘗試，或改用另一份 PDF。" });
+      toast.error("拆分時發生問題。", { description: "請重新嘗試，或改用另一份 PDF。" });
     } finally {
       setIsSplitting(false);
     }
@@ -1020,60 +1061,65 @@ export default function Home() {
                 </div>
               )}
             </DialogHeader>
-            <div ref={previewViewportRef} className="page-preview-canvas react-pdf-preview" aria-busy={isPreviewLoading} aria-label="可捲動的完整 PDF 頁面預覽" tabIndex={0}>
-              {previewDocumentFile && (
-                <Document
-                  file={previewDocumentFile}
-                  loading={<div className="preview-render-status"><Loader2 className="animate-spin" size={19} /><span>正在載入原始 PDF 頁面</span></div>}
-                  error={<div className="preview-render-status preview-render-status-error">無法載入這一頁，請關閉後再試。</div>}
-                  onLoadError={(error) => { console.error(error); setPreviewLoadError(true); setIsPreviewLoading(false); }}
-                >
-                  <div className={`page-edit-stage ${isTextEditing ? "page-edit-stage-editing" : ""}`}>
-                    <Page
-                      pageNumber={previewedPage.sourceIndex + 1}
-                      rotate={(previewedPage.sourceRotation + previewedPage.rotation) % 360}
-                      scale={Number.isFinite(previewZoom) && previewZoom > 0 ? previewZoom : 1}
-                      devicePixelRatio={Math.min(globalThis.devicePixelRatio || 1, 2)}
-                      renderAnnotationLayer
-                      renderTextLayer
-                      loading={<div className="preview-render-status"><Loader2 className="animate-spin" size={19} /><span>正在以向量品質繪製頁面</span></div>}
-                      error={<div className="preview-render-status preview-render-status-error">此頁無法完成渲染。</div>}
-                      onRenderSuccess={() => setIsPreviewLoading(false)}
-                      onRenderError={(error) => { console.error(error); setPreviewLoadError(true); setIsPreviewLoading(false); }}
-                    />
-                    <div ref={textAnnotationLayerRef} className="text-annotation-layer" onPointerMove={moveTextAnnotation} onPointerUp={finishTextAnnotationDrag} onPointerCancel={finishTextAnnotationDrag}>
-                      {previewedPage.textAnnotations.map((annotation) => {
-                        const annotationStyle = { left: `${annotation.x * 100}%`, top: `${annotation.y * 100}%`, fontSize: `${annotation.fontSize * previewZoom}px`, fontFamily: getTextFontCssFamily(annotation.fontFamily) };
-                        const isInlineEditing = inlineTextAnnotationId === annotation.id;
-                        return isInlineEditing ? (
-                          <InlineEditableTextAnnotation
-                            key={annotation.id}
-                            annotation={annotation}
-                            style={annotationStyle}
-                            editorRef={inlineTextElementRef}
-                            formatControlsRef={inlineTextFormatControlsRef}
-                            onFinish={finishInlineTextEdit}
-                            onDelete={deleteSelectedTextAnnotation}
-                          />
-                        ) : (
-                          <button
-                            key={annotation.id}
-                            type="button"
-                            className={`text-annotation ${selectedTextAnnotationId === annotation.id ? "text-annotation-selected" : ""} ${draggingTextAnnotation?.annotationId === annotation.id ? "text-annotation-dragging" : ""}`}
-                            style={annotationStyle}
-                            onPointerDown={(event) => startTextAnnotationDrag(event, annotation)}
-                            onDoubleClick={(event) => { if (!isTextEditing) return; event.stopPropagation(); beginInlineTextEdit(annotation); }}
-                            aria-label={`編輯文字：${annotation.text || DEFAULT_TEXT_CONTENT}；可拖曳移動，雙重點擊可直接修改`}
-                          >
-                            {annotation.text || DEFAULT_TEXT_CONTENT}
-                          </button>
-                        );
-                      })}
-                    </div>
+            <div ref={previewViewportRef} className="page-preview-canvas" aria-busy={isPreviewLoading} aria-label="可捲動的完整 PDF 頁面預覽" tabIndex={0}>
+              <div className={`page-edit-stage ${isTextEditing ? "page-edit-stage-editing" : ""}`}>
+                <canvas
+                  ref={previewCanvasRef}
+                  className="page-preview-canvas-surface"
+                  style={{
+                    display: "block",
+                    border: "1px solid #d7dbe1",
+                    background: "#ffffff",
+                    boxShadow: "0 16px 36px rgba(44,55,75,.17)",
+                  }}
+                />
+                {isPreviewLoading && !previewLoadError && (
+                  <div
+                    className="preview-render-status"
+                    style={{ position: "absolute", inset: 0, margin: "auto", width: "fit-content", height: "fit-content" }}
+                  >
+                    <Loader2 className="animate-spin" size={19} />
+                    <span>正在載入原始 PDF 頁面</span>
                   </div>
-                </Document>
-              )}
-              {previewLoadError && <div className="preview-render-status preview-render-status-error">高解析預覽載入失敗，請關閉後再試。</div>}
+                )}
+                {previewLoadError && (
+                  <div
+                    className="preview-render-status preview-render-status-error"
+                    style={{ position: "absolute", inset: 0, margin: "auto", width: "fit-content", height: "fit-content" }}
+                  >
+                    無法載入這一頁，請關閉後再試。
+                  </div>
+                )}
+                <div ref={textAnnotationLayerRef} className="text-annotation-layer" onPointerMove={moveTextAnnotation} onPointerUp={finishTextAnnotationDrag} onPointerCancel={finishTextAnnotationDrag}>
+                  {previewedPage.textAnnotations.map((annotation) => {
+                    const annotationStyle = { left: `${annotation.x * 100}%`, top: `${annotation.y * 100}%`, fontSize: `${annotation.fontSize * previewZoom}px`, fontFamily: getTextFontCssFamily(annotation.fontFamily) };
+                    const isInlineEditing = inlineTextAnnotationId === annotation.id;
+                    return isInlineEditing ? (
+                      <InlineEditableTextAnnotation
+                        key={annotation.id}
+                        annotation={annotation}
+                        style={annotationStyle}
+                        editorRef={inlineTextElementRef}
+                        formatControlsRef={inlineTextFormatControlsRef}
+                        onFinish={finishInlineTextEdit}
+                        onDelete={deleteSelectedTextAnnotation}
+                      />
+                    ) : (
+                      <button
+                        key={annotation.id}
+                        type="button"
+                        className={`text-annotation ${selectedTextAnnotationId === annotation.id ? "text-annotation-selected" : ""} ${draggingTextAnnotation?.annotationId === annotation.id ? "text-annotation-dragging" : ""}`}
+                        style={annotationStyle}
+                        onPointerDown={(event) => startTextAnnotationDrag(event, annotation)}
+                        onDoubleClick={(event) => { if (!isTextEditing) return; event.stopPropagation(); beginInlineTextEdit(annotation); }}
+                        aria-label={`編輯文字：${annotation.text || DEFAULT_TEXT_CONTENT}；可拖曳移動，雙重點擊可直接修改`}
+                      >
+                        {annotation.text || DEFAULT_TEXT_CONTENT}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
           </DialogContent>
         )}
