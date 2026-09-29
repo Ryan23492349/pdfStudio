@@ -27,14 +27,15 @@ import { Fragment, type ChangeEvent, type DragEvent, type PointerEvent as ReactP
 import { degrees, PDFDocument, rgb, StandardFonts, type PDFFont, type PDFPage } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import JSZip from "jszip";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { Document, Page, pdfjs } from "react-pdf";
-import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, useDialogComposition } from "@/components/ui/dialog";
 
-// 統一使用 react-pdf 所代理的 pdfjs 實例，避免 legacy 與非 legacy 兩份模組互相打架。
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
 // 修改這三行，加入 BASE_URL
@@ -344,14 +345,17 @@ export default function Home() {
   const previewedPageNumber = previewedPage ? pages.findIndex((page) => page.id === previewedPage.id) + 1 : 0;
   const previewSource = previewedPage ? pdfSources.find((source) => source.id === previewedPage.sourceId) ?? null : null;
 
-  // 關鍵修正：把 bytes 複製成一份「乾淨」的 Uint8Array 給 react-pdf，
-  // 避免 React-PDF 內部轉移（transfer）時把工作區共用的 buffer 也一起帶走。
-  const previewDocumentFile = useMemo(() => {
-    if (!previewSource) return null;
-    const safeBytes = new Uint8Array(previewSource.bytes.byteLength);
-    safeBytes.set(previewSource.bytes);
-    return { data: safeBytes };
-  }, [previewSource]);
+  /**
+   * 修正：pdf.js 在 getDocument() 時會把傳入的 TypedArray 底層 ArrayBuffer「轉移（detach）」給 Worker。
+   * 若沿用 useMemo 快取同一個 Uint8Array，第二次開啟預覧時就會拿到已 detach 的 buffer，
+   * 導致 "Cannot perform Construct on a detached ArrayBuffer"，頁面永遠載入失敗。
+   *
+   * 因此把 previewedPageId 也納入依賴，確保「每次開啟預覧」都產生一份全新的位元組副本。
+   */
+  const previewDocumentFile = useMemo(
+    () => (previewedPageId && previewSource ? { data: previewSource.bytes.slice() } : null),
+    [previewedPageId, previewSource]
+  );
 
   const previewPercent = Math.round(previewZoom * 100);
 
@@ -532,7 +536,7 @@ export default function Home() {
 
     try {
       const sourceBytes = new Uint8Array(await selectedFile.arrayBuffer());
-      const loadingTask = pdfjs.getDocument({ data: sourceBytes.slice() });
+      const loadingTask = pdfjsLib.getDocument({ data: sourceBytes.slice() });
       const pdf = await loadingTask.promise;
       const sourceId = createPageId();
 
@@ -607,7 +611,7 @@ export default function Home() {
     setIsSplitting(true);
     try {
       const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes)] as const)));
-      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjs.getDocument({ data: source.bytes.slice() }).promise] as const)));
+      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes.slice() }).promise] as const)));
       const baseName = file.name.replace(/\.pdf$/i, "") || "split-document";
       const zip = new JSZip();
       const boundaries = [0, ...selectedSplitPoints, pageCount];
@@ -665,7 +669,7 @@ export default function Home() {
     setIsExporting(true);
     try {
       const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes)] as const)));
-      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjs.getDocument({ data: source.bytes.slice() }).promise] as const)));
+      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes.slice() }).promise] as const)));
       const exportedPdf = await PDFDocument.create();
       const textFonts = await embedTextFonts(exportedPdf);
       for (const pageItem of pages) {
@@ -1022,7 +1026,6 @@ export default function Home() {
                   file={previewDocumentFile}
                   loading={<div className="preview-render-status"><Loader2 className="animate-spin" size={19} /><span>正在載入原始 PDF 頁面</span></div>}
                   error={<div className="preview-render-status preview-render-status-error">無法載入這一頁，請關閉後再試。</div>}
-                  onLoadSuccess={() => setPreviewLoadError(false)}
                   onLoadError={(error) => { console.error(error); setPreviewLoadError(true); setIsPreviewLoading(false); }}
                 >
                   <div className={`page-edit-stage ${isTextEditing ? "page-edit-stage-editing" : ""}`}>
