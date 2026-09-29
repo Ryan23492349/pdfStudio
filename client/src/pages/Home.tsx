@@ -344,8 +344,18 @@ export default function Home() {
   const previewedPage = pages.find((page) => page.id === previewedPageId) ?? null;
   const previewedPageNumber = previewedPage ? pages.findIndex((page) => page.id === previewedPage.id) + 1 : 0;
   const previewSource = previewedPage ? pdfSources.find((source) => source.id === previewedPage.sourceId) ?? null : null;
-  const previewDocumentFile = useMemo(() => previewSource ? { data: previewSource.bytes.slice() } : null, [previewSource]);
   const previewPercent = Math.round(previewZoom * 100);
+
+  // FIX: Use URL.createObjectURL instead of passing Uint8Array directly to react-pdf.
+  // Passing Uint8Array caused pdfjs-dist worker to detach the ArrayBuffer, throwing errors
+  // on subsequent renders or zoom changes. Creating an Object URL avoids detachment and streams efficiently.
+  const previewUrl = useMemo(() => previewSource ? URL.createObjectURL(previewSource.file) : null, [previewSource]);
+
+  useEffect(() => {
+    return () => {
+      if (previewUrl) URL.revokeObjectURL(previewUrl);
+    };
+  }, [previewUrl]);
 
   useEffect(() => {
     if (!previewedPageId) return;
@@ -598,7 +608,8 @@ export default function Home() {
     }
     setIsSplitting(true);
     try {
-      const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes)] as const)));
+      // FIX: Use .slice() to prevent pdf-lib from detaching the underlying ArrayBuffer
+      const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes.slice())] as const)));
       const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes.slice() }).promise] as const)));
       const baseName = file.name.replace(/\.pdf$/i, "") || "split-document";
       const zip = new JSZip();
@@ -656,7 +667,8 @@ export default function Home() {
     if (!file || pdfSources.length === 0 || pageCount === 0) return;
     setIsExporting(true);
     try {
-      const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes)] as const)));
+      // FIX: Use .slice() to prevent pdf-lib from detaching the underlying ArrayBuffer
+      const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes.slice())] as const)));
       const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes.slice() }).promise] as const)));
       const exportedPdf = await PDFDocument.create();
       const textFonts = await embedTextFonts(exportedPdf);
@@ -1009,9 +1021,9 @@ export default function Home() {
               )}
             </DialogHeader>
             <div ref={previewViewportRef} className="page-preview-canvas react-pdf-preview" aria-busy={isPreviewLoading} aria-label="可捲動的完整 PDF 頁面預覽" tabIndex={0}>
-              {previewDocumentFile && (
+              {previewUrl && (
                 <Document
-                  file={previewDocumentFile}
+                  file={previewUrl}
                   loading={<div className="preview-render-status"><Loader2 className="animate-spin" size={19} /><span>正在載入原始 PDF 頁面</span></div>}
                   error={<div className="preview-render-status preview-render-status-error">無法載入這一頁，請關閉後再試。</div>}
                   onLoadError={(error) => { console.error(error); setPreviewLoadError(true); setIsPreviewLoading(false); }}
