@@ -27,19 +27,21 @@ import { Fragment, type ChangeEvent, type DragEvent, type PointerEvent as ReactP
 import { degrees, PDFDocument, rgb, StandardFonts, type PDFFont, type PDFPage } from "pdf-lib";
 import fontkit from "@pdf-lib/fontkit";
 import JSZip from "jszip";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
-import pdfWorker from "pdfjs-dist/legacy/build/pdf.worker.min.mjs?url";
 import { Document, Page, pdfjs } from "react-pdf";
+import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, useDialogComposition } from "@/components/ui/dialog";
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
-pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
+// 統一使用 react-pdf 所代理的 pdfjs 實例，避免 legacy 與非 legacy 兩份模組互相打架。
+pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
-const LOGO_URL = "/manus-storage/pdf-splitter-logo_e764a730.png";
-const WORKSPACE_ART_URL = "/manus-storage/blueprint-workspace_7ab3ecdf.png";
+// 修改這三行，加入 BASE_URL
+const BASE_URL = import.meta.env.BASE_URL;
+const LOGO_URL = `${BASE_URL}manus-storage/pdf-splitter-logo_e764a730.png`;
+const WORKSPACE_ART_URL = `${BASE_URL}manus-storage/blueprint-workspace_7ab3ecdf.png`;
+
 
 type ToolButtonProps = {
   label: string;
@@ -106,7 +108,7 @@ const PREVIEW_ZOOM_MAX = 2.5;
 const PREVIEW_ZOOM_STEP = 0.25;
 const DEFAULT_TEXT_CONTENT = "輸入文字";
 const DEFAULT_TEXT_FONT_SIZE = 18;
-const PDF_CJK_FONT_URL = "/manus-storage/pdf-studio-cjk_7e82ee53.ttf";
+const PDF_CJK_FONT_URL = `${BASE_URL}manus-storage/pdf-studio-cjk_7e82ee53.ttf`;
 let cjkFontBytesPromise: Promise<ArrayBuffer> | null = null;
 
 const TEXT_FONT_OPTIONS: Array<{ value: PdfTextFont; label: string; cssFamily: string }> = [
@@ -341,7 +343,16 @@ export default function Home() {
   const previewedPage = pages.find((page) => page.id === previewedPageId) ?? null;
   const previewedPageNumber = previewedPage ? pages.findIndex((page) => page.id === previewedPage.id) + 1 : 0;
   const previewSource = previewedPage ? pdfSources.find((source) => source.id === previewedPage.sourceId) ?? null : null;
-  const previewDocumentFile = useMemo(() => previewSource ? { data: previewSource.bytes.slice() } : null, [previewSource]);
+
+  // 關鍵修正：把 bytes 複製成一份「乾淨」的 Uint8Array 給 react-pdf，
+  // 避免 React-PDF 內部轉移（transfer）時把工作區共用的 buffer 也一起帶走。
+  const previewDocumentFile = useMemo(() => {
+    if (!previewSource) return null;
+    const safeBytes = new Uint8Array(previewSource.bytes.byteLength);
+    safeBytes.set(previewSource.bytes);
+    return { data: safeBytes };
+  }, [previewSource]);
+
   const previewPercent = Math.round(previewZoom * 100);
 
   useEffect(() => {
@@ -521,7 +532,7 @@ export default function Home() {
 
     try {
       const sourceBytes = new Uint8Array(await selectedFile.arrayBuffer());
-      const loadingTask = pdfjsLib.getDocument({ data: sourceBytes.slice() });
+      const loadingTask = pdfjs.getDocument({ data: sourceBytes.slice() });
       const pdf = await loadingTask.promise;
       const sourceId = createPageId();
 
@@ -596,7 +607,7 @@ export default function Home() {
     setIsSplitting(true);
     try {
       const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes)] as const)));
-      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes.slice() }).promise] as const)));
+      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjs.getDocument({ data: source.bytes.slice() }).promise] as const)));
       const baseName = file.name.replace(/\.pdf$/i, "") || "split-document";
       const zip = new JSZip();
       const boundaries = [0, ...selectedSplitPoints, pageCount];
@@ -654,7 +665,7 @@ export default function Home() {
     setIsExporting(true);
     try {
       const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes)] as const)));
-      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes.slice() }).promise] as const)));
+      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjs.getDocument({ data: source.bytes.slice() }).promise] as const)));
       const exportedPdf = await PDFDocument.create();
       const textFonts = await embedTextFonts(exportedPdf);
       for (const pageItem of pages) {
@@ -719,36 +730,6 @@ export default function Home() {
     });
     setSplitPoints((current) => current.map((point) => (point >= pageIndex + 1 ? point + 1 : point)));
     toast.success("已複製頁面。", { description: "複本已插入於原始頁面的下一頁。" });
-  };
-
-  const addBlankPage = (pageIndex: number) => {
-    setPages((current) => {
-      const nextPages = [...current];
-      // 取得前一頁的資訊來建立空白頁（使用相同的 sourceId 和 rotation）
-      const prevPage = pages[pageIndex];
-      // 建立純白色頁面 (RGB 255, 255, 255)
-      const whitePageSvg = `
-        <svg width="200" height="283" xmlns="http://www.w3.org/2000/svg">
-          <rect width="100%" height="100%" fill="#FFFFFF" stroke="#CCCCCC" stroke-width="1"/>
-        </svg>
-      `;
-      const svgDataUri = 'data:image/svg+xml;base64,' + btoa(whitePageSvg);
-      
-      const blankPage: PdfPageItem = {
-        id: createPageId(),
-        sourceId: prevPage?.sourceId ?? "",
-        sourceIndex: prevPage?.sourceIndex ?? 0,
-        sourceRotation: prevPage?.sourceRotation ?? 0,
-        preview: svgDataUri,
-        rotation: 0,
-        textAnnotations: [],
-      };
-      // 插入空白頁到「前一頁」
-      nextPages.splice(pageIndex, 0, blankPage);
-      return nextPages;
-    });
-    setSplitPoints((current) => current.map((point) => (point >= pageIndex ? point + 1 : point)));
-    toast.success("已新增空白頁面。", { description: "空白頁已插入於目前頁面的前一頁。" });
   };
 
   const deletePage = (pageIndex: number) => {
@@ -955,7 +936,6 @@ export default function Home() {
                           <PageQuickAction tooltip="放大預覽" icon={<Search size={17} />} onClick={() => openPagePreview(page.id)} />
                           <PageQuickAction tooltip="向右旋轉 90°" icon={<RotateCw size={17} />} onClick={() => rotatePage(page.id)} />
                           <PageQuickAction tooltip="複製此頁" icon={<Copy size={16} />} onClick={() => duplicatePage(index)} />
-                          <PageQuickAction tooltip="新增空白頁" icon={<Plus size={16} />} onClick={() => addBlankPage(index)} />
                           <PageQuickAction tooltip="刪除此頁" icon={<Trash2 size={17} />} onClick={() => deletePage(index)} danger />
                         </div>
                         <div className="page-image-wrap"><img src={page.preview} alt={`第 ${pageNumber} 頁縮圖`} style={{ transform: `rotate(${page.rotation}deg)` }} /></div>
@@ -1014,7 +994,7 @@ export default function Home() {
           <DialogContent fullscreen className="page-preview-dialog page-preview-fullscreen">
             <DialogHeader className="page-preview-header pr-14">
               <DialogTitle className="font-[Manrope] text-[18px] font-extrabold tracking-[-0.03em]">第 {previewedPageNumber} 頁預覽</DialogTitle>
-              <DialogDescription>全螢幕預覽目前頁面；關閉後可返回 PDF 工作區繼續編輯。</DialogDescription>
+              <DialogDescription>全螢幕預覽目前頁面；關閉後可返回 PDF 工作區續編輯。</DialogDescription>
               <div className="preview-controls" role="toolbar" aria-label="預覽縮放控制">
                 <div className="preview-control-group">
                   <PreviewControlButton label={isTextEditing ? "結束文字編輯" : "文字編輯"} icon={<TextCursorInput size={16} />} active={isTextEditing} onClick={() => { setIsTextEditing((current) => !current); setSelectedTextAnnotationId(null); setInlineTextAnnotationId(null); setDraggingTextAnnotation(null); }} />
@@ -1042,6 +1022,7 @@ export default function Home() {
                   file={previewDocumentFile}
                   loading={<div className="preview-render-status"><Loader2 className="animate-spin" size={19} /><span>正在載入原始 PDF 頁面</span></div>}
                   error={<div className="preview-render-status preview-render-status-error">無法載入這一頁，請關閉後再試。</div>}
+                  onLoadSuccess={() => setPreviewLoadError(false)}
                   onLoadError={(error) => { console.error(error); setPreviewLoadError(true); setIsPreviewLoading(false); }}
                 >
                   <div className={`page-edit-stage ${isTextEditing ? "page-edit-stage-editing" : ""}`}>
