@@ -38,7 +38,6 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, us
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
 pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker;
 
-// 修改這三行，加入 BASE_URL
 const BASE_URL = import.meta.env.BASE_URL;
 const LOGO_URL = `${BASE_URL}manus-storage/pdf-splitter-logo_e764a730.png`;
 const WORKSPACE_ART_URL = `${BASE_URL}manus-storage/blueprint-workspace_7ab3ecdf.png`;
@@ -146,6 +145,15 @@ const embedTextFonts = async (document: PDFDocument): Promise<PdfTextFontBundle>
     cjk,
   };
 };
+
+/**
+ * 從 PdfSource 安全地取得一份全新的 Uint8Array。
+ * 透過 File.arrayBuffer() 重新讀取，避免使用已被 pdf.js Worker
+ * 或 pdf-lib detach 的舊 ArrayBuffer。
+ */
+const readFreshBytes = async (source: PdfSource): Promise<Uint8Array> => (
+  new Uint8Array(await source.file.arrayBuffer())
+);
 
 function drawTextAnnotations(
   targetPage: PDFPage,
@@ -340,22 +348,43 @@ export default function Home() {
   const [draggedPageId, setDraggedPageId] = useState<string | null>(null);
   const [dropTarget, setDropTarget] = useState<{ id: string; position: "before" | "after" } | null>(null);
 
+  /**
+   * ★ FIX ★
+   * 以 Object URL 取代直接對 Uint8Array.slice() 的 useMemo。
+   * File 物件在頁面生命周期內始終有效，不會被 Worker transfer 所 detach。
+   */
+  const [previewObjectUrl, setPreviewObjectUrl] = useState<string | null>(null);
+
   const pageCount = pages.length;
   const previewedPage = pages.find((page) => page.id === previewedPageId) ?? null;
   const previewedPageNumber = previewedPage ? pages.findIndex((page) => page.id === previewedPage.id) + 1 : 0;
   const previewSource = previewedPage ? pdfSources.find((source) => source.id === previewedPage.sourceId) ?? null : null;
   const previewPercent = Math.round(previewZoom * 100);
 
-  // FIX: Use URL.createObjectURL instead of passing Uint8Array directly to react-pdf.
-  // Passing Uint8Array caused pdfjs-dist worker to detach the ArrayBuffer, throwing errors
-  // on subsequent renders or zoom changes. Creating an Object URL avoids detachment and streams efficiently.
-  const previewUrl = useMemo(() => previewSource ? URL.createObjectURL(previewSource.file) : null, [previewSource]);
-
+  /**
+   * ★ FIX ★
+   * 每當 previewSource 改變時，從 File 建立一個全新的 Object URL。
+   * 關閉預覽或切換頁面時，cleanup 會自動 revoke 舊 URL，避免記憶體洩漏。
+   */
   useEffect(() => {
-    return () => {
-      if (previewUrl) URL.revokeObjectURL(previewUrl);
-    };
-  }, [previewUrl]);
+    if (!previewSource) {
+      setPreviewObjectUrl(null);
+      return;
+    }
+    const url = URL.createObjectURL(previewSource.file);
+    setPreviewObjectUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [previewSource]);
+
+  /**
+   * ★ FIX ★
+   * 以 Object URL 作為 react-pdf <Document> 的 file prop，
+   * 徹底避開對可能被 detach 的 Uint8Array 呼叫 .slice()。
+   */
+  const previewDocumentFile = useMemo(
+    () => (previewObjectUrl ? { url: previewObjectUrl } : null),
+    [previewObjectUrl],
+  );
 
   useEffect(() => {
     if (!previewedPageId) return;
@@ -608,9 +637,19 @@ export default function Home() {
     }
     setIsSplitting(true);
     try {
-      // FIX: Use .slice() to prevent pdf-lib from detaching the underlying ArrayBuffer
-      const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes.slice())] as const)));
-      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes.slice() }).promise] as const)));
+      /**
+       * ★ FIX ★
+       * 改用 readFreshBytes(source) 從 File 重新讀取字節，
+       * 避免使用已被 detach 的 source.bytes。
+       */
+      const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => {
+        const freshBytes = await readFreshBytes(source);
+        return [source.id, await PDFDocument.load(freshBytes)] as const;
+      })));
+      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => {
+        const freshBytes = await readFreshBytes(source);
+        return [source.id, await pdfjsLib.getDocument({ data: freshBytes }).promise] as const;
+      })));
       const baseName = file.name.replace(/\.pdf$/i, "") || "split-document";
       const zip = new JSZip();
       const boundaries = [0, ...selectedSplitPoints, pageCount];
@@ -657,7 +696,7 @@ export default function Home() {
       toast.success("ZIP 壓縮檔已準備完成。", { description: `壓縮檔內包含 ${selectedSplitPoints.length + 1} 份分拆後的 PDF，下載將由瀏覽器自動開始。` });
     } catch (error) {
       console.error(error);
-          toast.error("拆分時發生問題。", { description: "請重新嘗試，或改用另一份 PDF。" });
+      toast.error("拆分時發生問題。", { description: "請重新嘗試，或改用另一份 PDF。" });
     } finally {
       setIsSplitting(false);
     }
@@ -667,9 +706,19 @@ export default function Home() {
     if (!file || pdfSources.length === 0 || pageCount === 0) return;
     setIsExporting(true);
     try {
-      // FIX: Use .slice() to prevent pdf-lib from detaching the underlying ArrayBuffer
-      const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await PDFDocument.load(source.bytes.slice())] as const)));
-      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => [source.id, await pdfjsLib.getDocument({ data: source.bytes.slice() }).promise] as const)));
+      /**
+       * ★ FIX ★
+       * 改用 readFreshBytes(source) 從 File 重新讀取字節，
+       * 避免使用已被 detach 的 source.bytes。
+       */
+      const sourceDocuments = new Map(await Promise.all(pdfSources.map(async (source) => {
+        const freshBytes = await readFreshBytes(source);
+        return [source.id, await PDFDocument.load(freshBytes)] as const;
+      })));
+      const sourceRenderDocuments = new Map(await Promise.all(pdfSources.map(async (source) => {
+        const freshBytes = await readFreshBytes(source);
+        return [source.id, await pdfjsLib.getDocument({ data: freshBytes }).promise] as const;
+      })));
       const exportedPdf = await PDFDocument.create();
       const textFonts = await embedTextFonts(exportedPdf);
       for (const pageItem of pages) {
@@ -1021,9 +1070,10 @@ export default function Home() {
               )}
             </DialogHeader>
             <div ref={previewViewportRef} className="page-preview-canvas react-pdf-preview" aria-busy={isPreviewLoading} aria-label="可捲動的完整 PDF 頁面預覽" tabIndex={0}>
-              {previewUrl && (
+              {/* ★ FIX ★ 以 Object URL 取代 Uint8Array.slice()；null 時顯示載入提示 */}
+              {previewDocumentFile ? (
                 <Document
-                  file={previewUrl}
+                  file={previewDocumentFile}
                   loading={<div className="preview-render-status"><Loader2 className="animate-spin" size={19} /><span>正在載入原始 PDF 頁面</span></div>}
                   error={<div className="preview-render-status preview-render-status-error">無法載入這一頁，請關閉後再試。</div>}
                   onLoadError={(error) => { console.error(error); setPreviewLoadError(true); setIsPreviewLoading(false); }}
@@ -1072,6 +1122,8 @@ export default function Home() {
                     </div>
                   </div>
                 </Document>
+              ) : (
+                <div className="preview-render-status"><Loader2 className="animate-spin" size={19} /><span>正在準備預覽資料</span></div>
               )}
               {previewLoadError && <div className="preview-render-status preview-render-status-error">高解析預覽載入失敗，請關閉後再試。</div>}
             </div>
